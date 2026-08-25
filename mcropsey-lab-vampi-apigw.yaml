@@ -1,0 +1,370 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  mcropsey-lab - VAmPI (vulnerable REST API) on EC2 via Docker Compose,
+  fronted by a single REST API Gateway (v1). No CloudFront, no MailHog.
+
+  VAmPI is a JSON-only Flask API: no SPA, no absolute static asset paths,
+  no WebSocket, no outbound email. That removes every reason the crAPI build
+  needed CloudFront, so clients talk straight to the API Gateway /prod stage
+  and 100% of traffic is visible to the Noname connector.
+
+  NOTE: REST API (v1) is required - the Noname connector only discovers
+  AWS::ApiGateway::RestApi. HTTP API (v2) is silently ignored.
+
+Parameters:
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: mcropsey-lab-key
+    Description: AWS key pair name - must match ~/.ssh/mcropsey-lab-key.pem
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.micro, t3.small, t3.medium, t3.large]
+    Description: VAmPI is a single 41MB Flask container - t3.small is ample.
+
+  AMIId:
+    Type: AWS::EC2::Image::Id
+    Default: ami-0b4624933067d393a
+    Description: Amazon Linux 2023 - us-east-2 (SSH user is ec2-user)
+
+  AllowedSSHCIDR:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR allowed for SSH. deploy-vampi.sh locks this to your current IP.
+
+  VampiVulnerable:
+    Type: String
+    Default: '1'
+    AllowedValues: ['0', '1']
+    Description: >
+      1 = vulnerable mode (BOLA, mass assignment, SQLi, weak JWT all live).
+      0 = hardened mode - same endpoints, vulnerabilities patched. Useful for
+      measuring Noname false positives against an identical API surface.
+
+  VampiTokenTTL:
+    Type: String
+    Default: '3600'
+    Description: JWT lifetime in seconds. Upstream default is 60, which is too short for lab work.
+
+Resources:
+
+  # ─── Network ──────────────────────────────────────────────────────────────
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.2.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - {Key: Name, Value: mcropsey-lab-vpc}
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - {Key: Name, Value: mcropsey-lab-igw}
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.2.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - {Key: Name, Value: mcropsey-lab-subnet-pub1}
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - {Key: Name, Value: mcropsey-lab-rtb-pub}
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  # ─── Security Group ────────────────────────────────────────────────────────
+  #
+  # Port 8025 (MailHog) is gone. Only 22 and 5000 remain.
+  # 5000 must stay open to 0.0.0.0/0 because API Gateway integrations
+  # originate from non-static AWS IPs.
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: mcropsey-lab-ec2-sg
+      GroupDescription: VAmPI EC2 - SSH (22), VAmPI API (5000)
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedSSHCIDR
+          Description: SSH (locked to deployer IP by deploy-vampi.sh)
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          CidrIp: 0.0.0.0/0
+          Description: VAmPI REST API - API Gateway backend target
+      Tags:
+        - {Key: Name, Value: mcropsey-lab-ec2-sg}
+
+  # ─── Elastic IP ────────────────────────────────────────────────────────────
+
+  VampiEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - {Key: Name, Value: mcropsey-lab-eip}
+
+  VampiEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt VampiEIP.AllocationId
+      InstanceId: !Ref VampiInstance
+
+  # ─── EC2 Instance ──────────────────────────────────────────────────────────
+
+  VampiInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AMIId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
+
+          echo "==> System update"
+          dnf update -y
+
+          echo "==> Installing prerequisites"
+          dnf install -y jq
+
+          echo "==> Installing Docker"
+          dnf install -y docker
+          systemctl enable --now docker
+          usermod -aG docker ec2-user
+
+          echo "==> Installing Docker Compose standalone"
+          curl -fsSL \
+            "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64" \
+            -o /usr/local/bin/docker-compose
+          chmod +x /usr/local/bin/docker-compose
+
+          echo "==> Writing VAmPI compose file"
+          mkdir -p /opt/vampi
+          cd /opt/vampi
+
+          cat > docker-compose.yml <<'COMPOSE'
+          services:
+            vampi:
+              image: erev0s/vampi:latest
+              container_name: vampi
+              restart: always
+              ports:
+                - "5000:5000"
+              environment:
+                - vulnerable=${VampiVulnerable}
+                - tokentimetolive=${VampiTokenTTL}
+          COMPOSE
+
+          echo "==> Pulling and starting VAmPI (vulnerable=${VampiVulnerable}, ttl=${VampiTokenTTL}s)"
+          docker-compose pull --quiet
+          docker-compose up -d
+
+          echo "==> Seeding database via /createdb"
+          # VAmPI ships with an empty DB. Every data endpoint throws a SQLAlchemy
+          # error until /createdb is hit once. Retry until Flask is listening.
+          SEEDED=0
+          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+            if curl -fsS http://localhost:5000/createdb >/dev/null 2>&1; then
+              echo "==> Database seeded on attempt $attempt"
+              SEEDED=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$SEEDED" -ne 1 ]; then
+            echo "!!! WARNING: /createdb never succeeded. Seed manually:"
+            echo "!!!   curl http://localhost:5000/createdb"
+          fi
+
+          echo "==> Smoke test"
+          curl -fsS http://localhost:5000/ || true
+          echo ""
+
+          echo "==> Done at $(date)"
+      Tags:
+        - {Key: Name, Value: mcropsey-lab-instance}
+
+  # ─── VAmPI REST API (v1) ───────────────────────────────────────────────────
+  #
+  # Architecture: REST API (v1) catch-all HTTP_PROXY
+  #   Client → API GW (HTTPS, /prod stage) → EIP:5000 (HTTP) → VAmPI container
+  #
+  # Two resources/methods cover every path:
+  #   ANY /          — VAmPI home + /createdb sits one level down
+  #   ANY /{proxy+}  — everything with at least one path segment
+  #
+  # Why no CloudFront this time:
+  #   - VAmPI returns application/json only, so no BinaryMediaTypes needed.
+  #   - No compiled SPA, so no absolute /static/... asset paths to break
+  #     against the /prod stage prefix.
+  #   - No WebSocket, so nothing needs a connection upgrade.
+  # Result: the /prod URL IS the base URL, and every request is logged.
+
+  VampiApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/apigateway/mcropsey-lab-vampi
+      RetentionInDays: 14
+
+  VampiRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: mcropsey-lab-vampi-api
+      Description: mcropsey-lab REST API Gateway — VAmPI vulnerable API proxy
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - {Key: Name, Value: mcropsey-lab-vampi-api}
+        - {Key: Project, Value: mcropsey-lab}
+
+  VampiProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref VampiRestApi
+      ParentId: !GetAtt VampiRestApi.RootResourceId
+      PathPart: "{proxy+}"
+
+  VampiRootMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref VampiRestApi
+      ResourceId: !GetAtt VampiRestApi.RootResourceId
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: ANY
+        Uri: !Sub "http://${VampiEIP.PublicIp}:5000/"
+        PassthroughBehavior: WHEN_NO_MATCH
+        TimeoutInMillis: 29000
+
+  VampiProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref VampiRestApi
+      ResourceId: !Ref VampiProxyResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.proxy: true
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: ANY
+        Uri: !Sub "http://${VampiEIP.PublicIp}:5000/{proxy}"
+        RequestParameters:
+          integration.request.path.proxy: method.request.path.proxy
+        PassthroughBehavior: WHEN_NO_MATCH
+        TimeoutInMillis: 29000
+
+  VampiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - VampiRootMethod
+      - VampiProxyMethod
+    Properties:
+      RestApiId: !Ref VampiRestApi
+
+  VampiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref VampiRestApi
+      DeploymentId: !Ref VampiDeployment
+      StageName: prod
+      # Access log format kept byte-identical to the crAPI stack so the existing
+      # Noname forwarder/Kinesis pipeline parses it without any change.
+      AccessLogSetting:
+        DestinationArn: !GetAtt VampiApiLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","sourceIp":"$context.identity.sourceIp","requestTime":"$context.requestTime","method":"$context.httpMethod","path":"$context.path","status":"$context.status","responseLength":"$context.responseLength","integrationStatus":"$context.integrationStatus","integrationError":"$context.integrationErrorMessage","userAgent":"$context.identity.userAgent"}'
+
+Outputs:
+
+  ApiGatewayURL:
+    Description: VAmPI BASE_URL — REST API Gateway prod stage (Noname-captured)
+    Value: !Sub "https://${VampiRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  CreateDbURL:
+    Description: Re-seed the VAmPI database (already run once at boot)
+    Value: !Sub "https://${VampiRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/createdb"
+
+  SwaggerUIDirect:
+    Description: >
+      Swagger UI — use the DIRECT EIP URL. Connexion points the UI at an absolute
+      /openapi.json which 403s behind the /prod stage prefix.
+    Value: !Sub "http://${VampiEIP.PublicIp}:5000/ui/"
+
+  VampiDirect:
+    Description: VAmPI direct via Elastic IP (HTTP, bypasses API GW — not Noname-captured)
+    Value: !Sub "http://${VampiEIP.PublicIp}:5000"
+
+  RestApiId:
+    Description: REST API Gateway ID (for Noname resource matching)
+    Value: !Ref VampiRestApi
+
+  ElasticIP:
+    Description: Stable Elastic IP address for the VAmPI EC2 instance
+    Value: !GetAtt VampiEIP.PublicIp
+
+  SSHCommand:
+    Description: SSH into the VAmPI instance (Amazon Linux 2023 — user is ec2-user)
+    Value: !Sub "ssh -i ~/.ssh/mcropsey-lab-key.pem ec2-user@${VampiEIP.PublicIp}"
+
+  DockerLogsCommand:
+    Description: Tail VAmPI container logs after SSH
+    Value: "cd /opt/vampi && docker-compose logs -f"
+
+  CloudWatchLogGroup:
+    Description: VAmPI API Gateway access log group in CloudWatch
+    Value: /aws/apigateway/mcropsey-lab-vampi
+
+  StackNameTagForNoname:
+    Description: Value to use in the Noname connection rule (tag key aws:cloudformation:stack-name)
+    Value: !Ref AWS::StackName
