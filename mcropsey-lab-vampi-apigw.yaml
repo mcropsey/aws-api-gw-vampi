@@ -13,6 +13,13 @@ Description: >
 
 Parameters:
 
+  Prefix:
+    Type: String
+    Default: mcropsey-aws-gw
+    Description: Name prefix applied to every resource name and tag in this stack
+    AllowedPattern: "^[a-z][a-z0-9-]{1,30}$"
+    ConstraintDescription: Lowercase letters, digits and hyphens; must start with a letter
+
   KeyPairName:
     Type: AWS::EC2::KeyPair::KeyName
     Default: mcropsey-lab-key
@@ -25,9 +32,11 @@ Parameters:
     Description: VAmPI is a single 41MB Flask container - t3.small is ample.
 
   AMIId:
-    Type: AWS::EC2::Image::Id
-    Default: ami-0b4624933067d393a
-    Description: Amazon Linux 2023 - us-east-2 (SSH user is ec2-user)
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: >
+      Amazon Linux 2023 (SSH user is ec2-user). Resolved from the SSM public
+      parameter at deploy time so the image never goes stale.
 
   AllowedSSHCIDR:
     Type: String
@@ -59,13 +68,13 @@ Resources:
       EnableDnsHostnames: true
       EnableDnsSupport: true
       Tags:
-        - {Key: Name, Value: mcropsey-lab-vpc}
+        - {Key: Name, Value: !Sub "${Prefix}-vpc"}
 
   InternetGateway:
     Type: AWS::EC2::InternetGateway
     Properties:
       Tags:
-        - {Key: Name, Value: mcropsey-lab-igw}
+        - {Key: Name, Value: !Sub "${Prefix}-igw"}
 
   IGWAttachment:
     Type: AWS::EC2::VPCGatewayAttachment
@@ -81,14 +90,14 @@ Resources:
       AvailabilityZone: !Select [0, !GetAZs ""]
       MapPublicIpOnLaunch: true
       Tags:
-        - {Key: Name, Value: mcropsey-lab-subnet-pub1}
+        - {Key: Name, Value: !Sub "${Prefix}-subnet-pub1"}
 
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref VPC
       Tags:
-        - {Key: Name, Value: mcropsey-lab-rtb-pub}
+        - {Key: Name, Value: !Sub "${Prefix}-rtb-pub"}
 
   PublicDefaultRoute:
     Type: AWS::EC2::Route
@@ -113,7 +122,7 @@ Resources:
   EC2SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupName: mcropsey-lab-ec2-sg
+      GroupName: !Sub "${Prefix}-ec2-sg"
       GroupDescription: VAmPI EC2 - SSH (22), VAmPI API (5000)
       VpcId: !Ref VPC
       SecurityGroupIngress:
@@ -128,7 +137,7 @@ Resources:
           CidrIp: 0.0.0.0/0
           Description: VAmPI REST API - API Gateway backend target
       Tags:
-        - {Key: Name, Value: mcropsey-lab-ec2-sg}
+        - {Key: Name, Value: !Sub "${Prefix}-ec2-sg"}
 
   # ─── Elastic IP ────────────────────────────────────────────────────────────
 
@@ -138,7 +147,7 @@ Resources:
     Properties:
       Domain: vpc
       Tags:
-        - {Key: Name, Value: mcropsey-lab-eip}
+        - {Key: Name, Value: !Sub "${Prefix}-eip"}
 
   VampiEIPAssociation:
     Type: AWS::EC2::EIPAssociation
@@ -230,7 +239,7 @@ Resources:
 
           echo "==> Done at $(date)"
       Tags:
-        - {Key: Name, Value: mcropsey-lab-instance}
+        - {Key: Name, Value: !Sub "${Prefix}-vampi"}
 
   # ─── VAmPI REST API (v1) ───────────────────────────────────────────────────
   #
@@ -248,23 +257,53 @@ Resources:
   #   - No WebSocket, so nothing needs a connection upgrade.
   # Result: the /prod URL IS the base URL, and every request is logged.
 
-  VampiApiLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: /aws/apigateway/mcropsey-lab-vampi
-      RetentionInDays: 14
+  # NOTE: there is deliberately no AWS::Logs::LogGroup here, and VampiStage has
+  # no AccessLogSetting. Both used to exist and both broke the Noname connector.
+  #
+  # The connector owns API Gateway access logging end to end: it PATCHes the
+  # stage's accessLogSettings to its own "[NONAME]...[NONAME]" delimited format
+  # and points them at the log group it manages itself,
+  #   API-Gateway-Execution-Logs_<restApiId>/<stageName>
+  # then attaches the "noname-filter" subscription filter that ships the lines
+  # to Kinesis. All 19 working stages in this account follow exactly that shape.
+  #
+  # When the stage instead points at a pre-existing, customer-created log group,
+  # the connector takes its "adopt an existing log group" branch, which fails on
+  # operation step 2 for api-gateway with a CloudWatch Logs validation error:
+  #   1 validation error detected: Value at 'tags' failed to satisfy
+  #   constraint: Member must have length greater than or equal to 1
+  # (Verified: logs:TagResource with tags:{} reproduces that string byte for
+  # byte; apigateway:TagResource with tags:{} returns a different error, so the
+  # failing call is against CloudWatch Logs, not API Gateway.) The Processor then
+  # retries every ~15 min forever and the resource never comes online, while the
+  # connector itself keeps reporting healthy.
+  #
+  # Contributing factor, left alone on purpose: mcropsey-orchestrator was
+  # deployed 2026-08-21 with CloudWatchRetentionPolicyOverride=false and predates
+  # the CustomTags parameter, so the Lambdas have no CUSTOM_TAGS env var at all.
+  # Setting that override to true would let the connector rewrite retention on
+  # *other people's* existing log groups in this shared account, so don't.
+  #
+  # Net effect: nothing is lost. Access logs still exist and are still captured
+  # by Noname — just in the connector-managed group instead of a custom one.
 
   VampiRestApi:
     Type: AWS::ApiGateway::RestApi
     Properties:
-      Name: mcropsey-lab-vampi-api
-      Description: mcropsey-lab REST API Gateway — VAmPI vulnerable API proxy
+      Name: !Sub "${Prefix}-vampi-api"
+      Description: !Sub "${Prefix} REST API Gateway - VAmPI vulnerable API proxy"
       EndpointConfiguration:
         Types:
           - REGIONAL
       Tags:
-        - {Key: Name, Value: mcropsey-lab-vampi-api}
-        - {Key: Project, Value: mcropsey-lab}
+        - {Key: Name, Value: !Sub "${Prefix}-vampi-api"}
+        - {Key: Project, Value: !Sub "${Prefix}"}
+        # Required marker tag for the Noname connector: APIs without this key
+        # are skipped by the API Security Server. The value is ignored, so it
+        # stays empty - but the KEY must be non-empty or AWS rejects the whole
+        # tag set with "Member must have length greater than or equal to 1".
+        # Must sit on the RestApi, not the Stage.
+        - {Key: inspected-by-noname-security, Value: ""}
 
   VampiProxyResource:
     Type: AWS::ApiGateway::Resource
@@ -319,11 +358,31 @@ Resources:
       RestApiId: !Ref VampiRestApi
       DeploymentId: !Ref VampiDeployment
       StageName: prod
-      # Access log format kept byte-identical to the crAPI stack so the existing
-      # Noname forwarder/Kinesis pipeline parses it without any change.
-      AccessLogSetting:
-        DestinationArn: !GetAtt VampiApiLogGroup.Arn
-        Format: '{"requestId":"$context.requestId","sourceIp":"$context.identity.sourceIp","requestTime":"$context.requestTime","method":"$context.httpMethod","path":"$context.path","status":"$context.status","responseLength":"$context.responseLength","integrationStatus":"$context.integrationStatus","integrationError":"$context.integrationErrorMessage","userAgent":"$context.identity.userAgent"}'
+      # Tags here are cosmetic / for the Noname connection rule. They are NOT the
+      # reason the connector was failing — the stage was tagged and step 2 still
+      # failed. See the long note above VampiRestApi for the real cause.
+      Tags:
+        - {Key: Name, Value: !Sub "${Prefix}-vampi-api-prod"}
+        - {Key: Project, Value: !Sub "${Prefix}"}
+      # No AccessLogSetting on purpose — the connector PATCHes its own in.
+      # Do not add one back; it re-breaks discovery. See note above VampiRestApi.
+      #
+      # MethodSettings IS required, and was the actual fix (2026-09-16). With
+      # methodSettings empty, execution logging is off, so API Gateway never
+      # auto-creates API-Gateway-Execution-Logs_<restApiId>/<stageName>. That
+      # forces the connector down its CreateLogGroup path, where it sends
+      # tags:{} — an empty map, which CloudWatch Logs rejects with
+      #   Value at 'tags' failed to satisfy constraint:
+      #   Member must have length greater than or equal to 1
+      # and the resource never comes online. Turning execution logging on lets
+      # AWS create that group, so the connector skips CreateLogGroup and goes
+      # straight to attaching noname-filter. This is why all the working stages
+      # in this account have loggingLevel INFO + dataTrace true.
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: INFO
+          DataTraceEnabled: true
 
 Outputs:
 
@@ -355,15 +414,18 @@ Outputs:
 
   SSHCommand:
     Description: SSH into the VAmPI instance (Amazon Linux 2023 — user is ec2-user)
-    Value: !Sub "ssh -i ~/.ssh/mcropsey-lab-key.pem ec2-user@${VampiEIP.PublicIp}"
+    Value: !Sub "ssh -i ~/.ssh/${KeyPairName}.pem ec2-user@${VampiEIP.PublicIp}"
 
   DockerLogsCommand:
     Description: Tail VAmPI container logs after SSH
     Value: "cd /opt/vampi && docker-compose logs -f"
 
   CloudWatchLogGroup:
-    Description: VAmPI API Gateway access log group in CloudWatch
-    Value: /aws/apigateway/mcropsey-lab-vampi
+    Description: >
+      VAmPI API Gateway access log group — created and owned by the Noname
+      connector, not by this stack. It only appears after the connector has
+      successfully configured the stage.
+    Value: !Sub "API-Gateway-Execution-Logs_${VampiRestApi}/prod"
 
   StackNameTagForNoname:
     Description: Value to use in the Noname connection rule (tag key aws:cloudformation:stack-name)

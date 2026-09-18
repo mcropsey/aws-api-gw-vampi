@@ -16,7 +16,11 @@
 
 set -euo pipefail
 
-STACK="mcropsey-lab"
+# Every resource name and tag in the stack derives from PREFIX. Its twin
+# environment lives in ../aws-f5-vampi (prefix mcropsey-f5) and shares nothing
+# with this one: separate VPC, separate stack, separate API surface.
+PREFIX="mcropsey-aws-gw"
+STACK="mcropsey-aws-gw-vampi"
 REGION="us-east-2"
 KEY_PAIR="mcropsey-lab-key"
 TEMPLATE="$(dirname "$0")/mcropsey-lab-vampi-apigw.yaml"
@@ -55,6 +59,7 @@ else
 fi
 
 echo "==> AWS account: $(aws sts get-caller-identity --query Account --output text)"
+echo "==> Prefix:      $PREFIX"
 echo "==> Region:      $REGION"
 echo "==> Stack:       $STACK"
 echo "==> Key pair:    $KEY_PAIR"
@@ -85,6 +90,7 @@ aws cloudformation deploy \
   --stack-name "$STACK" \
   --region "$REGION" \
   --parameter-overrides \
+    Prefix="$PREFIX" \
     KeyPairName="$KEY_PAIR" \
     AllowedSSHCIDR="$MY_IP" \
     VampiVulnerable="$VULN"
@@ -179,3 +185,4 @@ echo "  - Swagger UI must be reached on the DIRECT EIP URL. Connexion points the
 echo "    UI at an absolute /openapi.json, which 403s behind the /prod prefix."
 echo "  - Re-seed the DB any time with: curl $BASE_URL/createdb"
 echo "  - Flip to patched mode for false-positive testing: ./deploy-vampi.sh --secure"
+echo "  - The F5-fronted twin of this lab: ../aws-f5-vampi (prefix mcropsey-f5)"

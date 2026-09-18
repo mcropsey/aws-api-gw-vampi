@@ -12,9 +12,29 @@
 
 set -euo pipefail
 
-BASE_URL="https://ppcc9onu1h.execute-api.us-east-2.amazonaws.com/prod"
-EIP="3.135.133.6"
+# Resolved from the live stack so these never go stale after a --fresh redeploy
+# (which mints a new API Gateway id and a new EIP). Override by exporting
+# BASE_URL / EIP before running.
+STACK="${STACK:-mcropsey-aws-gw-vampi}"
+REGION="${REGION:-us-east-2}"
+
+stack_out() {
+  aws cloudformation describe-stacks --stack-name "$STACK" --region "$REGION" \
+    --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text 2>/dev/null
+}
+
+BASE_URL="${BASE_URL:-$(stack_out ApiGatewayURL)}"
+EIP="${EIP:-$(stack_out ElasticIP)}"
 PEM="$HOME/.ssh/mcropsey-lab-key.pem"
+
+if [[ -z "$BASE_URL" || "$BASE_URL" == "None" ]]; then
+  echo "ERROR: could not read ApiGatewayURL from stack '$STACK' in $REGION." >&2
+  echo "       Deploy it first (./deploy-vampi.sh), or export BASE_URL yourself." >&2
+  exit 1
+fi
+
+echo "==> BASE_URL: $BASE_URL"
+echo "==> EIP:      $EIP"
 LOOPS=1
 if [[ "${1:-}" == "--loop" ]]; then LOOPS="${2:-3}"; fi
 
