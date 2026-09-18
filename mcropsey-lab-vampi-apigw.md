@@ -1,13 +1,86 @@
-# mcropsey-lab — VAmPI + API Gateway
-**Converted from crAPI:** 2026-08-25 | Region: us-east-2 | Stack: `mcropsey-lab`
+# mcropsey-aws-gw — VAmPI + API Gateway
+
+**Converted from crAPI:** 2026-08-25 | **Renamed + redeployed:** 2026-09-15 |
+**Doc refreshed against live AWS:** 2026-09-18 | Region: us-east-2 | Stack: `mcropsey-aws-gw-vampi`
+
+> **The stack was renamed.** It used to be `mcropsey-lab`; it is now
+> `mcropsey-aws-gw-vampi`, and every resource name derives from the `Prefix`
+> parameter (`mcropsey-aws-gw`). The old name, the old API Gateway id
+> `ppcc9onu1h` and the old EIP `3.135.133.6` are all dead — they appeared
+> throughout the previous version of this doc.
+>
+> **Twin environment:** the same VAmPI fronted by an F5 BIG-IP instead of an API
+> Gateway lives in `../aws-f5-vampi` (prefix `mcropsey-f5`, VPC `10.0.0.0/16`).
+> The two share nothing: separate VPCs, stacks, key pairs and outputs. Either
+> can be torn down without touching the other.
 
 > **After any redeploy**, refresh live values:
 > ```bash
-> aws cloudformation describe-stacks --stack-name mcropsey-lab --region us-east-2 \
+> aws cloudformation describe-stacks --stack-name mcropsey-aws-gw-vampi --region us-east-2 \
 >   --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' --output table
 > ```
 > There are no CloudFront distributions in this stack. The API GW id changes on
 > `--fresh` redeploy — update Live Values and the Noname connection rule.
+
+---
+
+## ⚠ Known drift: the committed template is not what is running
+
+Verified 2026-09-18 with `aws cloudformation detect-stack-drift`. The live stack
+was created 2026-09-15 and **has never been updated**, but the stage
+configuration has been changed out of band since. Two things follow:
+
+**1. The Noname connector has overwritten the stage's access logging.** Drift on
+`VampiStage`:
+
+| Property | Template expects | Actually live |
+|---|---|---|
+| `AccessLogSetting/DestinationArn` | `…log-group:/aws/apigateway/mcropsey-aws-gw-vampi:*` | `…log-group:API-Gateway-Execution-Logs_7wz0kp5wyb/prod` |
+| `AccessLogSetting/Format` | the crAPI JSON format | `[NONAME]$context.requestId,…[NONAME]` |
+
+This is correct and intended — see `noname-connector.md`. The connector owns
+access logging end to end.
+
+**2. `mcropsey-lab-vampi-apigw.yaml` has uncommitted edits that encode the fix
+but have not been deployed.** The working tree removes `VampiApiLogGroup` and
+the `AccessLogSetting`, and adds the `MethodSettings` block that actually made
+the connector work. The deployed stack still contains `VampiApiLogGroup`
+(`/aws/apigateway/mcropsey-aws-gw-vampi`, `IN_SYNC`, ~353 KB, **no subscription
+filter — it receives nothing**).
+
+**Consequence, and the reason this section exists:** running `./deploy-vampi.sh`
+against the *committed* template would reset `AccessLogSetting` back to the
+custom log group and re-break connector discovery. Running it against the
+*working-tree* template converges everything correctly. Deploy the working tree,
+or don't deploy at all.
+
+---
+
+## Live Values
+
+Verified against the live stack 2026-09-18.
+
+| | URL / Value |
+|---|---|
+| **VAmPI API** (BASE_URL) | `https://7wz0kp5wyb.execute-api.us-east-2.amazonaws.com/prod` |
+| **Swagger UI** (direct only — see note) | `http://3.20.29.82:5000/ui/` |
+| **VAmPI direct** (bypasses GW) | `http://3.20.29.82:5000` |
+| **Elastic IP** | `3.20.29.82` |
+| **REST API GW id** | `7wz0kp5wyb` |
+| **REST API GW name** | `mcropsey-aws-gw-vampi-api` |
+| **Prefix** | `mcropsey-aws-gw` |
+| **SSH** | `ssh -i ~/.ssh/mcropsey-lab-key.pem ec2-user@3.20.29.82` |
+| **Access log group** | `API-Gateway-Execution-Logs_7wz0kp5wyb/prod` (connector-owned) |
+| **Noname stack-id** | `arn:aws:cloudformation:us-east-2:491489166083:stack/mcropsey-aws-gw-vampi/5664b470-b126-11f1-afa9-0651ae3222a5` |
+| **Noname stack-name tag** | `mcropsey-aws-gw-vampi` |
+
+Smoke-tested 2026-09-18: `/`, `/users/v1`, `/books/v1` all return `200` through
+the gateway, and `http://3.20.29.82:5000/` returns `200` directly.
+
+> **Don't hand-copy these into scripts.** `test-all-endpoints.sh` now resolves
+> `BASE_URL` and `EIP` from the stack outputs at runtime, so it survives a
+> `--fresh` redeploy. Override with `BASE_URL=… EIP=… ./test-all-endpoints.sh`
+> if you need to point it elsewhere.
 
 ---
 
@@ -26,21 +99,21 @@
 removed. One API Gateway remains, and **every request to BASE_URL is Noname-visible** —
 the crAPI build had MailHog web UI traffic bypassing the gateway.
 
----
+## What changed at the 2026-09-15 rename
 
-## Live Values
-
-Last deployed: 2026-08-25 | Stack: `mcropsey-lab` | Region: `us-east-2`
-
-| | URL / Value |
+| Change | Detail |
 |---|---|
-| **VAmPI API** (BASE_URL) | `https://ppcc9onu1h.execute-api.us-east-2.amazonaws.com/prod` |
-| **Swagger UI** (direct only — see note) | `http://3.135.133.6:5000/ui/` |
-| **VAmPI direct** (bypasses GW) | `http://3.135.133.6:5000` |
-| **Elastic IP** | `3.135.133.6` |
-| **REST API GW id** | `ppcc9onu1h` |
-| **SSH** | `ssh -i ~/.ssh/mcropsey-lab-key.pem ec2-user@3.135.133.6` |
-| **Noname stack-id** | `arn:aws:cloudformation:us-east-2:491489166083:stack/mcropsey-lab/4a1d7240-a08e-11f1-8d50-0a6a3177c90f` |
+| `Prefix` parameter added | Default `mcropsey-aws-gw`, pattern `^[a-z][a-z0-9-]{1,30}$`. Every resource name and `Name` tag is now `!Sub "${Prefix}-…"`. |
+| Stack renamed | `mcropsey-lab` → `mcropsey-aws-gw-vampi` |
+| EC2 `Name` tag | `mcropsey-lab-instance` → `mcropsey-aws-gw-vampi` |
+| AMI no longer hardcoded | Was `ami-0b4624933067d393a`. Now an `AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>` pointing at `/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64`, so the image never goes stale. Currently resolves to `ami-09f2f3eeb95b394f2`. |
+| `SSHCommand` output | Now derives the key filename from `${KeyPairName}` instead of hardcoding it. |
+| Noname marker tag added | `inspected-by-noname-security` on the RestApi — **required**, see `noname-connector.md`. |
+| Access logging handed to the connector | `VampiApiLogGroup` + `AccessLogSetting` removed; `MethodSettings` added. See the drift section above. |
+
+The `Prefix` pattern forbids a trailing hyphen and caps at 31 characters; a
+value like `MyLab` or `mcropsey-` is rejected at deploy time rather than
+producing half-renamed resources.
 
 ---
 
@@ -48,17 +121,21 @@ Last deployed: 2026-08-25 | Stack: `mcropsey-lab` | Region: `us-east-2`
 
 ```
                     ┌─────────────────────────────────────────────────────┐
-                    │  mcropsey-lab CloudFormation Stack                  │
+                    │  mcropsey-aws-gw-vampi CloudFormation Stack         │
                     │                                                     │
-You (HTTPS) ──────► │  REST API GW: mcropsey-lab-vampi-api                │
+You (HTTPS) ──────► │  REST API GW: mcropsey-aws-gw-vampi-api (7wz0kp5wyb)│
                     │    /prod stage → ANY / + ANY /{proxy+}              │
-                    │    CloudWatch logs → Noname via Kinesis             │
+                    │    tag: inspected-by-noname-security                │
+                    │    execution logging INFO + dataTrace (required)    │
+                    │    access logs → API-Gateway-Execution-Logs_<id>/prod│
+                    │      └──► subscription filter "noname-filter"       │
+                    │           → Kinesis → Noname                        │
                     │    └──► EC2 EIP:5000 → VAmPI container              │
                     │                                                     │
-                    │  EC2 t3.small AL2023 @ 3.135.133.6                  │
+                    │  EC2 t3.small AL2023 @ 3.20.29.82                   │
                     │    Docker Compose /opt/vampi                        │
-                    │    └─ erev0s/vampi:latest  → :5000  (SQLite, in-container)
-                    │    └─ mcropsey-lab-vpc 10.2.0.0/16                  │
+                    │    └─ erev0s/vampi:latest → :5000 (SQLite, in-container)
+                    │    └─ mcropsey-aws-gw-vpc 10.2.0.0/16               │
                     └─────────────────────────────────────────────────────┘
 ```
 
@@ -77,7 +154,13 @@ You (HTTPS) ──────► │  REST API GW: mcropsey-lab-vampi-api      
   identical API surface with the vulnerabilities patched. Useful for measuring Noname
   false positives against a known-good baseline.
 - **Port 5000 open to `0.0.0.0/0`** — required because API GW integrations originate
-  from non-static AWS IPs.
+  from non-static AWS IPs. SSH (22) is restricted to `AllowedSSHCIDR`, which
+  `deploy-vampi.sh` pins to your workstation's `/32` at deploy time — so SSH stops
+  working when your public IP changes, and the fix is to re-run the deploy script.
+- **Execution logging is deliberately on** (`MethodSettings` → `LoggingLevel: INFO`,
+  `DataTraceEnabled: true`). This is not for debugging — the connector depends on it.
+  See `noname-connector.md`. `DataTraceEnabled` logs full request/response bodies, so
+  treat that log group as sensitive; it is fine here because VAmPI holds only dummy data.
 
 ### Swagger UI caveat
 
@@ -87,7 +170,7 @@ root, missing `/prod`, and gets a 403 — so "Try it out" won't work through the
 
 This is cosmetic and has three workarounds, in order of preference:
 
-1. Use the direct EIP URL: `http://3.135.133.6:5000/ui/`
+1. Use the direct EIP URL: `http://3.20.29.82:5000/ui/`
 2. Import `openapi_specs/openapi3.yml` from the VAmPI repo into Postman or Noname
    and set the server URL to your `/prod` base URL.
 3. Ignore it — everything in Quick Test below works fine with curl.
@@ -97,17 +180,17 @@ This is cosmetic and has three workarounds, in order of preference:
 ## Deploy / Redeploy
 
 ```bash
-cd ~/Downloads/aws-api-gw-crapi     # or wherever you keep the template
+cd ~/Downloads/aws-api-gw-vampi
 
 ./deploy-vampi.sh            # deploy or update in place
 ./deploy-vampi.sh --fresh    # tear down completely and redeploy from scratch
 ./deploy-vampi.sh --secure   # deploy with vulnerable=0 (patched baseline)
 ```
 
-**Migrating from the crAPI stack:** the resource set changed substantially, so an
-in-place update won't work. Run `./deploy-vampi.sh --fresh` once. This deletes the
-crAPI stack (including both CloudFront distributions) and builds the VAmPI stack under
-the same `mcropsey-lab` name.
+Read the drift section at the top of this doc before deploying. The script
+passes `Prefix`, `KeyPairName`, `AllowedSSHCIDR` and `VampiVulnerable` as
+parameter overrides and prints the resolved prefix, region, stack and key pair
+before it starts.
 
 **Timing after `--fresh`:**
 - CFN stack creates: ~3 min (no CloudFront — this is the big win)
@@ -117,8 +200,14 @@ the same `mcropsey-lab` name.
 The deploy script polls the API GW URL and runs a smoke test automatically, so you'll
 know it's live before it exits.
 
+**After a `--fresh` redeploy the API GW id changes**, which means a new log group
+name (`API-Gateway-Execution-Logs_<newid>/prod`) and a new stack ARN. Work
+through the checklist in `noname-connector.md`.
+
 **Prerequisites (one-time):** Key pair `mcropsey-lab-key` must exist in AWS us-east-2
-with `~/.ssh/mcropsey-lab-key.pem` locally. AWS-generated keys break macOS OpenSSH 10+ —
+with `~/.ssh/mcropsey-lab-key.pem` locally. (The key pair kept its original name
+through the rename — it is shared with nothing else and renaming it would have
+forced a fresh instance.) AWS-generated keys break macOS OpenSSH 10+ —
 generate locally and import:
 ```bash
 ssh-keygen -t ed25519 -f ~/.ssh/mcropsey-lab-key -N ""
@@ -139,7 +228,7 @@ restart, but if you ever recreate the container, hit `/createdb` again.
 
 ```bash
 INSTANCE_ID=$(aws ec2 describe-instances --region us-east-2 \
-  --filters "Name=tag:Name,Values=mcropsey-lab-instance" \
+  --filters "Name=tag:Name,Values=mcropsey-aws-gw-vampi" \
   --query "Reservations[0].Instances[0].InstanceId" --output text)
 
 aws ec2 stop-instances --region us-east-2 --instance-ids "$INSTANCE_ID"
@@ -152,11 +241,19 @@ aws ec2 start-instances --region us-east-2 --instance-ids "$INSTANCE_ID"
 ## Tear Down
 
 ```bash
-aws cloudformation delete-stack --stack-name mcropsey-lab --region us-east-2
-aws cloudformation wait stack-delete-complete --stack-name mcropsey-lab --region us-east-2
+aws cloudformation delete-stack --stack-name mcropsey-aws-gw-vampi --region us-east-2
+aws cloudformation wait stack-delete-complete --stack-name mcropsey-aws-gw-vampi --region us-east-2
 ```
 
 Faster than the crAPI teardown — CloudFront distributions had to disable before deleting.
+
+The connector-owned log group `API-Gateway-Execution-Logs_7wz0kp5wyb/prod` is
+**not** a stack resource and will survive the delete. Remove it by hand if you
+care about the storage:
+
+```bash
+aws logs delete-log-group --log-group-name "API-Gateway-Execution-Logs_7wz0kp5wyb/prod" --region us-east-2
+```
 
 ---
 
@@ -164,7 +261,7 @@ Faster than the crAPI teardown — CloudFront distributions had to disable befor
 
 ```bash
 # SSH
-ssh -i ~/.ssh/mcropsey-lab-key.pem ec2-user@3.135.133.6
+ssh -i ~/.ssh/mcropsey-lab-key.pem ec2-user@3.20.29.82
 
 # Container status / logs
 cd /opt/vampi && docker-compose ps
@@ -181,14 +278,18 @@ sed -i 's/vulnerable=1/vulnerable=0/' docker-compose.yml
 docker-compose up -d --force-recreate
 curl http://localhost:5000/createdb
 
-# CloudWatch API GW errors
-aws logs filter-log-events --log-group-name /aws/apigateway/mcropsey-lab-vampi \
-  --region us-east-2 --filter-pattern '"status":"502"' \
-  --query 'events[*].message' --output text
+# API GW errors — note this is the connector-owned execution log group, and the
+# access-log lines in it are [NONAME]-delimited CSV, not JSON
+aws logs filter-log-events --log-group-name "API-Gateway-Execution-Logs_7wz0kp5wyb/prod" \
+  --region us-east-2 --filter-pattern '"[NONAME]"' \
+  --query 'events[*].message' --output text | head -20
 
 # Stack outputs (refresh live values after redeploy)
-aws cloudformation describe-stacks --stack-name mcropsey-lab --region us-east-2 \
+aws cloudformation describe-stacks --stack-name mcropsey-aws-gw-vampi --region us-east-2 \
   --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' --output table
+
+# Check for configuration drift (expect VampiStage MODIFIED — that's the connector)
+aws cloudformation detect-stack-drift --stack-name mcropsey-aws-gw-vampi --region us-east-2
 ```
 
 ---
@@ -196,7 +297,10 @@ aws cloudformation describe-stacks --stack-name mcropsey-lab --region us-east-2 
 ## Quick Test
 
 ```bash
-BASE_URL="https://ppcc9onu1h.execute-api.us-east-2.amazonaws.com/prod"
+BASE_URL=$(aws cloudformation describe-stacks --stack-name mcropsey-aws-gw-vampi \
+  --region us-east-2 --query "Stacks[0].Outputs[?OutputKey=='ApiGatewayURL'].OutputValue" \
+  --output text)
+# currently: https://7wz0kp5wyb.execute-api.us-east-2.amazonaws.com/prod
 
 # Home — confirms the gateway → EC2 path works
 curl -s "$BASE_URL/" | jq .
@@ -218,6 +322,9 @@ curl -s "$BASE_URL/me" -H "Authorization: Bearer $TOKEN" | jq .
 curl -s "$BASE_URL/books/v1" -H "Authorization: Bearer $TOKEN" | jq .
 ```
 
+Or just run `./test-all-endpoints.sh`, which resolves the URL itself and walks
+every endpoint. `./test-all-endpoints.sh --loop 5` repeats it to generate volume.
+
 ---
 
 ## Troubleshooting
@@ -227,17 +334,22 @@ curl -s "$BASE_URL/books/v1" -H "Authorization: Bearer $TOKEN" | jq .
 | `{"message":"..."}` SQLAlchemy / no such table | DB never seeded | `curl "$BASE_URL/createdb"` |
 | 502/503 from API GW | VAmPI still starting | Wait ~2 min; SSH → `docker-compose ps` + `sudo tail -f /var/log/user-data.log` |
 | 504 Gateway Timeout | Container unhealthy | SSH → `cd /opt/vampi && docker-compose restart` |
-| 403 on `/openapi.json` from Swagger UI | Connexion uses an absolute spec path; `/prod` prefix is missing | Use `http://3.135.133.6:5000/ui/`, or import the OpenAPI spec into Postman/Noname |
+| 403 on `/openapi.json` from Swagger UI | Connexion uses an absolute spec path; `/prod` prefix is missing | Use `http://3.20.29.82:5000/ui/`, or import the OpenAPI spec into Postman/Noname |
 | 403 `Missing Authentication Token` from API GW | Hitting the API GW root without `/prod`, or a path with no matching method | Confirm the URL includes `/prod` |
 | Token rejected immediately after login | `tokentimetolive` too short | Stack default is 3600s; check the `VampiTokenTTL` parameter |
 | SSH permission denied | Wrong user or key perms | User is `ec2-user`; `chmod 400 ~/.ssh/mcropsey-lab-key.pem` |
-| Noname not discovering API GW | API GW must be REST v1 type | Confirm stack uses `AWS::ApiGateway::RestApi`, not `AWS::ApiGatewayV2::Api` |
-| Noname sees no traffic after conversion | Connection rule still points at the old stack-id, or the old crAPI log group | Update the rule (see noname-connector.md) |
+| SSH times out | Your public IP changed | `AllowedSSHCIDR` is pinned to your `/32` at deploy time; re-run `./deploy-vampi.sh` |
+| Noname not discovering API GW | Missing `inspected-by-noname-security` tag, or API GW is not REST v1 | See `noname-connector.md` gotchas 0 and 8 |
+| Noname sees no traffic | Connection rule points at the old stack-id / old stack name | Rule value is now `mcropsey-aws-gw-vampi`, not `mcropsey-lab` |
+| Noname resource stuck, Processor retrying every ~15 min | Empty-tag CreateLogGroup failure | See `noname-connector.md` gotcha 9 — the fix is `MethodSettings`, already in the template |
 | Stack update fails on resource type change | In-place won't work | `./deploy-vampi.sh --fresh` |
+| Scripts point at `ppcc9onu1h` / `3.135.133.6` | Pre-rename hardcoded values | Both are dead. Pull from stack outputs. |
 
 ---
 
-## VAmPI Endpoints — BASE_URL: `https://ppcc9onu1h.execute-api.us-east-2.amazonaws.com/prod`
+## VAmPI Endpoints
+
+BASE_URL: `https://7wz0kp5wyb.execute-api.us-east-2.amazonaws.com/prod`
 
 ### Setup / unauthenticated
 | Method | Path | Notes |
@@ -290,4 +402,6 @@ testing, add a second service to `/opt/vampi/docker-compose.yml` on port 5001, o
 in the security group, and add a second `AWS::ApiGateway::RestApi` pointed at `:5001`.
 
 Not included in the template by default — it doubles the gateway count and the whole
-point of this conversion was to cut overhead.
+point of this conversion was to cut overhead. The second gateway would also need its
+own `inspected-by-noname-security` tag and its own execution logging enabled, or Noname
+will only ever see the first one.

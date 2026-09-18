@@ -1,7 +1,9 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  mcropsey-lab - VAmPI (vulnerable REST API) on EC2 via Docker Compose,
+  mcropsey-aws-gw - VAmPI (vulnerable REST API) on EC2 via Docker Compose,
   fronted by a single REST API Gateway (v1). No CloudFront, no MailHog.
+  Resource names derive from the Prefix parameter. The F5-fronted twin of
+  this lab is ../aws-f5-vampi (prefix mcropsey-f5).
 
   VAmPI is a JSON-only Flask API: no SPA, no absolute static asset paths,
   no WebSocket, no outbound email. That removes every reason the crAPI build
@@ -278,11 +280,23 @@ Resources:
   # retries every ~15 min forever and the resource never comes online, while the
   # connector itself keeps reporting healthy.
   #
-  # Contributing factor, left alone on purpose: mcropsey-orchestrator was
-  # deployed 2026-08-21 with CloudWatchRetentionPolicyOverride=false and predates
-  # the CustomTags parameter, so the Lambdas have no CUSTOM_TAGS env var at all.
-  # Setting that override to true would let the connector rewrite retention on
-  # *other people's* existing log groups in this shared account, so don't.
+  # Where the empty tag map comes from (re-verified 2026-09-18 against the
+  # connector stacks redeployed 2026-09-16): mcropsey-orchestrator-stack is
+  # deployed with CustomTags={}, and NonameConfiguratorProcessor-02ab7fbdd39f
+  # carries CUSTOM_TAGS={} — so the connector passes tags:{} straight through.
+  #   aws lambda get-function-configuration --region us-east-2 \
+  #     --function-name NonameConfiguratorProcessor-02ab7fbdd39f \
+  #     --query 'Environment.Variables.CUSTOM_TAGS'   # -> "{}"
+  # (An earlier version of this comment said the orchestrator predated the
+  # CustomTags parameter and had no CUSTOM_TAGS var at all. That was true of the
+  # 2026-08-21 deployment, not the current one. The workaround below is
+  # unaffected either way.)
+  #
+  # Setting CustomTags to a non-empty map would fix this at the root, but the
+  # orchestrator is shared infrastructure in a multi-tenant account, so it is
+  # left alone on purpose. Likewise leave CloudWatchRetentionPolicyOverride at
+  # false — flipping it would let the connector rewrite retention on *other
+  # people's* existing log groups in this account.
   #
   # Net effect: nothing is lost. Access logs still exist and are still captured
   # by Noname — just in the connector-managed group instead of a custom one.
